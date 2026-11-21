@@ -1,73 +1,287 @@
 #!/usr/bin/env python3
-"""A small OpenAI-compatible server that proxies to ollama.
+"""A small OpenAI-compatible server that proxies to ollama and Home Assistant.
 
-POST /v1/chat/completions: the received text (the last user message) is
-sent to ollama's `qwen3.5:2b` with thinking disabled (`think: false`, the
-API form of `ollama run qwen3.5:2b --think=false`). With `stream: true`
-the model's reply is streamed back as standard OpenAI chunks ending with
-`data: [DONE]`; otherwise it returns a normal `chat.completion` JSON.
+POST /v1/chat/completions: the received text is sent to ollama's `qwen3.5:2b`
+with thinking disabled (`think: false`). The model gets Home Assistant state
+two ways:
+
+1. Prompt states: the server fetches the states of relevant HA entities
+   (`GET http://127.0.0.1:8123/api/states`) and adds them to the prompt as
+   context (refreshed every HA_REFRESH_INTERVAL seconds, 10 minutes).
+2. A tool: the server offers the model the tool
+   `get_home_assistant_state(entity_id)`; when the model returns tool calls,
+   the server fetches the state and gives it back to the model.
+
+With `stream: true` the final reply streams back as standard OpenAI chunks
+ending with `data: [DONE]`; otherwise it returns a `chat.completion` JSON.
 """
 
 import json
+import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 OLLAMA_HOST = "http://127.0.0.1:11434"
 OLLAMA_MODEL = "qwen3.5:2b"
+HA_BASE_URL = "http://127.0.0.1:8123"
+HA_TOKEN_FILE = Path("ha_token")  # HA long-lived access token for the API
+HA_REFRESH_INTERVAL = 600  # 10 minutes
+HA_TRACKED_ENTITIES = {
+    "sensor.saj_battery_1_soc": "battery SoC",
+    "sensor.power_production_now": "current solar power coming in",
+    "sensor.saj_total_load_power": "current power used",
+    "sensor.home_energy_manager_state": "state of the heatpump",
+}
+HA_UNITS = {
+    "battery SoC": "percent",
+    "current solar power coming in": "Watt",
+    "current power used": "Watt",
+}
+DEFAULT_ENTITY = "Battery 1 SOC"
+MAX_TOOL_ROUNDS = 5
 CHAT_COMPLETIONS_PATHS = {"/v1/chat/completions", "/chat/completions"}
 DEFAULT_PORT = 8971
+LLM_LOG_FILE = Path("llm.log")
 
 
-def extract_text(body):
-    """The text to send to ollama: the last user message of the request."""
-    for message in reversed(body.get("messages") or []):
-        if isinstance(message, dict) and message.get("role") == "user":
-            content = message.get("content")
-            if isinstance(content, str):
-                return content
-            if isinstance(content, list):
-                return "".join(
-                    part.get("text", "")
-                    for part in content
-                    if isinstance(part, dict)
-                )
-    return ""
+def _normalize(text):
+    return "".join(c.lower() for c in str(text) if c.isalnum())
 
 
-def ollama_request(text):
-    return urllib.request.Request(
-        OLLAMA_HOST + "/api/chat",
-        data=json.dumps(
-            {
-                "model": OLLAMA_MODEL,
-                "messages": [{"role": "user", "content": text}],
-                "stream": True,
-                "think": False,
-            }
-        ).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+def entity_matches(entity, names):
+    """True when the entity's id or friendly name contains any of the (normalized) names."""
+    haystack = _normalize(entity.get("entity_id", "")) + " " + _normalize(
+        (entity.get("attributes") or {}).get("friendly_name", "")
+    )
+    return any(_normalize(name) in haystack for name in names)
+
+
+def _strong_name_match(entity, name):
+    """Match an entity against a name, ignoring digits and spacing.
+
+    So 'battery_soc' or 'battery SoC' matches sensor.saj_battery_1_soc.
+    """
+    if entity_matches(entity, [name]):
+        return True
+    key = "".join(c for c in _normalize(name) if not c.isdigit())
+    if not key:
+        return False
+    for text in (
+        _normalize(entity.get("entity_id", "")),
+        _normalize((entity.get("attributes") or {}).get("friendly_name", "")),
+    ):
+        compact = "".join(c for c in text if not c.isdigit())
+        if compact and (key in compact or compact in key):
+            return True
+    return False
+
+
+# --- Home Assistant ---------------------------------------------------------
+
+def ha_token():
+    token = os.environ.get("HA_TOKEN")
+    if token:
+        return token
+    try:
+        return HA_TOKEN_FILE.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def fetch_all_ha_states():
+    """GET http://127.0.0.1:8123/api/states -> list of entity state dicts."""
+    token = ha_token()
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(HA_BASE_URL + "/api/states", headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read())
+
+
+def fetch_relevant_ha_states():
+    """The HA entities in HA_TRACKED_ENTITIES, or None if there's no token."""
+    if ha_token() is None:
+        return None
+    try:
+        states = fetch_all_ha_states()
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    return [entity for entity in states if entity_matches(entity, HA_TRACKED_ENTITIES)]
+
+
+_ha_state_cache = {"fetched_at": 0.0, "states": []}
+
+
+def cached_ha_states():
+    if time.time() - _ha_state_cache["fetched_at"] > HA_REFRESH_INTERVAL:
+        states = fetch_relevant_ha_states()
+        if states is not None:
+            _ha_state_cache["states"] = states
+        _ha_state_cache["fetched_at"] = time.time()
+    return _ha_state_cache["states"]
+
+
+def ha_context():
+    """Prompt context: the current states of the relevant HA entities."""
+    states = cached_ha_states()
+    if not states:
+        return ""
+    lines = ["Home Assistant state (current):"]
+    for entity in states:
+        name = HA_TRACKED_ENTITIES.get(entity.get("entity_id", ""))
+        if name:
+            unit = HA_UNITS.get(name)
+            value = entity.get("state", "")
+            if unit:
+                value = f"{value} {unit}"
+            lines.append(f"- {name}: {value}")
+    return "\n".join(lines)
+
+
+def _entity_json(entity):
+    entity_id = entity.get("entity_id")
+    name = HA_TRACKED_ENTITIES.get(entity_id, entity_id)
+    attributes = {
+        key: value
+        for key, value in (entity.get("attributes") or {}).items()
+        if key != "friendly_name"
+    }
+    return json.dumps(
+        {"name": name, "state": entity.get("state"), "attributes": attributes}
     )
 
 
-def iter_ollama_chunks(text):
-    """Yield the model's reply as it streams from ollama."""
-    with urllib.request.urlopen(ollama_request(text), timeout=300) as resp:
+def get_home_assistant_state(entity_id=None):
+    """Tool executor: return the JSON of the requested HA entity's state."""
+    token = ha_token()
+    if token is None:
+        return "Error: no Home Assistant access token available."
+    name = (entity_id or "").strip() or DEFAULT_ENTITY
+    try:
+        req = urllib.request.Request(
+            HA_BASE_URL + "/api/states/" + urllib.parse.quote(name, safe=""),
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return _entity_json(json.loads(resp.read()))
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            return f"Error: fetching {name!r} failed (HTTP {error.code})."
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        return f"Error: fetching {name!r} failed: {error}"
+    # The name isn't a live entity id; resolve it against the full states list.
+    try:
+        matches = [
+            entity
+            for entity in fetch_all_ha_states()
+            if _strong_name_match(entity, name)
+        ]
+    except (urllib.error.URLError, OSError, ValueError):
+        return "Error: could not fetch Home Assistant states."
+    for entity in matches:
+        if entity.get("entity_id") in HA_TRACKED_ENTITIES:
+            return _entity_json(entity)
+    if matches:
+        return _entity_json(matches[0])
+    return f"Entity {name!r} not found in Home Assistant."
+
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_home_assistant_state",
+            "description": "Fetch the current state of a Home Assistant entity from the running Home Assistant instance.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entity_id": {
+                        "type": "string",
+                        "description": "Entity id or name of the entity to fetch, e.g. the battery SoC.",
+                    }
+                },
+            },
+        },
+    }
+]
+
+
+def execute_tool(tool_call):
+    function = tool_call.get("function") or {}
+    name = function.get("name", "")
+    arguments = function.get("arguments") or {}
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError:
+            arguments = {}
+    if name != "get_home_assistant_state":
+        return f"Error: unknown tool {name!r}."
+    return get_home_assistant_state(arguments.get("entity_id"))
+
+
+# --- ollama -----------------------------------------------------------------
+
+def log_llm(tag, data):
+    """Append an LLM interaction record (tag + data as JSON) to llm.log."""
+    try:
+        with LLM_LOG_FILE.open("a") as log:
+            log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {tag}\n")
+            log.write(json.dumps(data, ensure_ascii=False, indent=2))
+            log.write("\n\n")
+    except OSError:
+        pass
+
+
+def iter_ollama_events(messages, tools=None):
+    """Call ollama /api/chat (streaming) and yield the assistant message events."""
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": messages,
+        "stream": True,
+        "think": False,
+    }
+    if tools:
+        payload["tools"] = tools
+    log_llm("REQUEST", {"model": payload["model"], "messages": messages, "tools": tools})
+    req = urllib.request.Request(
+        OLLAMA_HOST + "/api/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=300) as resp:
         for line in resp:
             line = line.strip()
             if not line:
                 continue
             event = json.loads(line)
-            message = event.get("message") or {}
-            content = message.get("content") or ""
-            if content:
-                yield content
             if event.get("done"):
                 return
+            yield event
+
+
+def run_model(ollama_messages, sink):
+    """Call the model; sink(part) for each content part; return the tool calls."""
+    tool_calls = []
+    content_parts = []
+    for event in iter_ollama_events(ollama_messages, TOOLS):
+        message = event.get("message") or {}
+        content = (message.get("content") or "").replace("**", "")
+        if content and sink:
+            sink(content)
+        if content:
+            content_parts.append(content)
+        if message.get("tool_calls"):
+            tool_calls.extend(message["tool_calls"])
+    log_llm("RESPONSE", {"content": "".join(content_parts), "tool_calls": tool_calls})
+    return tool_calls
 
 
 def make_chunk(id_, created, model, delta, finish_reason=None):
@@ -105,29 +319,81 @@ class Handler(BaseHTTPRequestHandler):
 
         model = str(body.get("model") or OLLAMA_MODEL)
         stream = bool(body.get("stream"))
-        text = extract_text(body)
+        user_messages = [
+            message
+            for message in (body.get("messages") or [])
+            if isinstance(message, dict)
+        ]
 
-        if stream:
-            self._stream_from_ollama(model, text)
-        else:
-            self._completion_from_ollama(model, text)
-
-    def _stream_from_ollama(self, model, text):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Transfer-Encoding", "chunked")
-        self.end_headers()
+        context = ha_context()
+        ollama_messages = user_messages
+        if context:
+            ollama_messages = [{"role": "system", "content": context}] + ollama_messages
 
         rid = "chatcmpl-" + uuid.uuid4().hex
         created = int(time.time())
-        try:
-            self._send_sse(make_chunk(rid, created, model, {"role": "assistant"}))
-            for part in iter_ollama_chunks(text):
+        collected = []
+
+        def sink(part):
+            if stream:
                 self._send_sse(make_chunk(rid, created, model, {"content": part}))
+            else:
+                collected.append(part)
+
+        if stream:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self._send_sse(make_chunk(rid, created, model, {"role": "assistant"}))
+
+        try:
+            for _ in range(MAX_TOOL_ROUNDS):
+                tool_calls = run_model(ollama_messages, sink)
+                if not tool_calls:
+                    break
+                ollama_messages = ollama_messages + [
+                    {"role": "assistant", "content": "", "tool_calls": tool_calls}
+                ]
+                for tool_call in tool_calls:
+                    result = execute_tool(tool_call)
+                    ollama_messages.append({"role": "tool", "content": result})
+                    log_llm("TOOL", {"call": tool_call, "result": result})
+        except (OSError, urllib.error.URLError):
+            pass
+
+        if not stream:
+            completion = {
+                "id": rid,
+                "object": "chat.completion",
+                "created": created,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "".join(collected)},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+            }
+            data = json.dumps(completion).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        try:
             self._send_sse(make_chunk(rid, created, model, {}, "stop"))
             self._write_chunk(b"data: [DONE]\n\n")
-        except (OSError, urllib.error.URLError):
+        except OSError:
             pass
         finally:
             try:
@@ -136,45 +402,17 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
-    def _completion_from_ollama(self, model, text):
-        try:
-            content = "".join(iter_ollama_chunks(text))
-        except (urllib.error.URLError, OSError) as error:
-            self.send_error(500, f"ollama call failed: {error}")
-            return
-
-        completion = {
-            "id": "chatcmpl-" + uuid.uuid4().hex,
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": content},
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-            },
-        }
-        data = json.dumps(completion).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    try:
+        cached_ha_states()  # warm the HA state cache at startup
+    except Exception:
+        pass
     print(
         f"OpenAI-compatible streaming server on http://127.0.0.1:{port}/v1/chat/completions "
-        f"(sends text to ollama {OLLAMA_MODEL} with thinking disabled)",
+        f"(sends text to ollama {OLLAMA_MODEL} with thinking disabled; HA states from {HA_BASE_URL})",
         flush=True,
     )
     server.serve_forever()
