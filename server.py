@@ -8,9 +8,11 @@ two ways:
 1. Prompt states: the server fetches the states of relevant HA entities
    (`GET http://127.0.0.1:8123/api/states`) and adds them to the prompt as
    context (refreshed every HA_REFRESH_INTERVAL seconds, 10 minutes).
-2. A tool: the server offers the model the tool
-   `get_home_assistant_state(entity_id)`; when the model returns tool calls,
-   the server fetches the state and gives it back to the model.
+2. Tools: the server offers the model the tools
+   `get_home_assistant_state(entity_id)` (fetch a state) and
+   `set_light(entity_id, state, brightness, color)` (turn a light on/off,
+   set brightness or color); when the model returns tool calls, the server
+   runs them and gives the results back to the model.
 
 With `stream: true` the final reply streams back as standard OpenAI chunks
 ending with `data: [DONE]`; otherwise it returns a `chat.completion` JSON.
@@ -42,6 +44,12 @@ HA_UNITS = {
     "battery SoC": "percent",
     "current solar power coming in": "Watt",
     "current power used": "Watt",
+}
+HA_TRACKED_LIGHTS = {
+    "light.all_lights": "All lights",
+    "light.piano_lights": "Piano lights",
+    "light.kajplats_e27_cws_globe_1055lm": "Living room light",
+    "light.kajplats_e27_cws_globe_1055lm_2": "Dining room light",
 }
 DEFAULT_ENTITY = "Battery 1 SOC"
 MAX_TOOL_ROUNDS = 5
@@ -103,6 +111,30 @@ def fetch_all_ha_states():
     req = urllib.request.Request(HA_BASE_URL + "/api/states", headers=headers)
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read())
+
+
+def _ha_service_call(service, data):
+    """Call an HA service: POST {HA_BASE_URL}/api/services/{service} with the data.
+
+    Returns the service response, or None on failure.
+    """
+    token = ha_token()
+    if token is None:
+        return None
+    req = urllib.request.Request(
+        HA_BASE_URL + "/api/services/" + service,
+        data=json.dumps(data).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read())
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
 
 
 def fetch_relevant_ha_states():
@@ -193,6 +225,185 @@ def get_home_assistant_state(entity_id=None):
     return f"Entity {name!r} not found in Home Assistant."
 
 
+def _resolve_light_entity(name):
+    """Resolve a light name or entity id to a tracked HA light entity id."""
+    name = (name or "").strip()
+    if not name:
+        return None
+    for entity_id, user_name in HA_TRACKED_LIGHTS.items():
+        if _strong_name_match(
+            {"entity_id": entity_id, "attributes": {"friendly_name": user_name}}, name
+        ):
+            return entity_id
+    try:
+        states = fetch_all_ha_states()
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    matches = [
+        entity
+        for entity in states
+        if entity.get("entity_id", "").startswith("light.")
+        and _strong_name_match(entity, name)
+    ]
+    for entity in matches:
+        if entity.get("entity_id") in HA_TRACKED_LIGHTS:
+            return entity.get("entity_id")
+    if matches:
+        return matches[0].get("entity_id")
+    return None
+
+
+def _light_result(entity):
+    """Tool result for a light: its user-facing name and current state."""
+    entity_id = entity.get("entity_id")
+    attributes = entity.get("attributes") or {}
+    result = {
+        "name": HA_TRACKED_LIGHTS.get(entity_id, entity_id),
+        "state": entity.get("state"),
+    }
+    if attributes.get("brightness") is not None:
+        result["brightness"] = attributes.get("brightness")
+    return json.dumps(result)
+
+
+_COLOR_NAMES = {
+    "red": (255, 0, 0),
+    "green": (0, 128, 0),
+    "blue": (0, 0, 255),
+    "white": (255, 255, 255),
+    "black": (0, 0, 0),
+    "yellow": (255, 255, 0),
+    "orange": (255, 165, 0),
+    "purple": (128, 0, 128),
+    "pink": (255, 192, 203),
+    "cyan": (0, 255, 255),
+    "magenta": (255, 0, 255),
+    "lime": (0, 255, 0),
+    "teal": (0, 128, 128),
+    "navy": (0, 0, 128),
+    "maroon": (128, 0, 0),
+    "olive": (128, 128, 0),
+    "silver": (192, 192, 192),
+    "gray": (128, 128, 128),
+    "grey": (128, 128, 128),
+    "brown": (165, 42, 42),
+    "gold": (255, 215, 0),
+    "violet": (238, 130, 238),
+    "indigo": (75, 0, 130),
+    "coral": (255, 127, 80),
+    "turquoise": (64, 224, 208),
+    "salmon": (250, 128, 114),
+    "lavender": (230, 230, 250),
+    "khaki": (240, 230, 140),
+    "beige": (245, 245, 220),
+    "crimson": (220, 20, 60),
+    "skyblue": (135, 206, 235),
+    "palegreen": (152, 251, 152),
+}
+
+
+def _parse_color(color):
+    """Parse a color string ('red', '#ff0000', '#f00', 'rgb(255, 0, 0)') to an [r, g, b] list."""
+    text = str(color).strip().lower()
+    if not text:
+        return None
+    if text.startswith("#"):
+        hexpart = text[1:]
+        if len(hexpart) == 3:
+            hexpart = "".join(c * 2 for c in hexpart)
+        if len(hexpart) >= 6:
+            try:
+                return [
+                    int(hexpart[0:2], 16),
+                    int(hexpart[2:4], 16),
+                    int(hexpart[4:6], 16),
+                ]
+            except ValueError:
+                return None
+        return None
+    if text.startswith("rgb"):
+        try:
+            parts = [int(v) for v in text[3:].strip("()").split(",")]
+        except ValueError:
+            return None
+        if len(parts) >= 3:
+            return [
+                max(0, min(255, parts[0])),
+                max(0, min(255, parts[1])),
+                max(0, min(255, parts[2])),
+            ]
+        return None
+    rgb = _COLOR_NAMES.get(text.replace(" ", "").replace("_", "").replace("-", ""))
+    return list(rgb) if rgb else None
+
+
+def set_light(entity_id=None, state=None, brightness=None, color=None):
+    """Tool executor: turn a light on/off, set brightness or color via the HA service."""
+    if ha_token() is None:
+        return "Error: no Home Assistant access token available."
+    resolved = _resolve_light_entity(entity_id)
+    if resolved is None:
+        return f"Error: light {(entity_id or '')!r} not found in Home Assistant."
+    if (state or "").strip().lower() == "off":
+        service = "light/turn_off"
+        data = {"entity_id": resolved}
+    else:
+        service = "light/turn_on"
+        data = {"entity_id": resolved}
+        if brightness is None:
+            data["brightness"] = 255  # full brightness
+        else:
+            try:
+                level = float(brightness)
+            except (TypeError, ValueError):
+                level = None
+            if level is not None:
+                level = max(0.0, min(100.0, level))
+                data["brightness"] = int(round(level * 2.55))
+        if color is not None and str(color).strip():
+            rgb = _parse_color(color)
+            if rgb is None:
+                return f"Error: unrecognized color {color!r}."
+            data["rgb_color"] = rgb
+    # Capture the current state before the call (to poll for the change).
+    previous = None
+    try:
+        for entity in fetch_all_ha_states():
+            if entity.get("entity_id") == resolved:
+                previous = entity.get("state")
+                break
+    except (urllib.error.URLError, OSError, ValueError):
+        pass
+    if _ha_service_call(service, data) is None:
+        return f"Error: could not call the HA service for {resolved!r}."
+    # Poll briefly for the new state (HA applies service calls asynchronously).
+    expected = "off" if service == "light/turn_off" else "on"
+    for _ in range(20):
+        time.sleep(0.5)
+        try:
+            states = fetch_all_ha_states()
+        except (urllib.error.URLError, OSError, ValueError):
+            break
+        for entity in states:
+            if entity.get("entity_id") != resolved:
+                continue
+            state = entity.get("state")
+            if state == expected or state != previous:
+                return _light_result(entity)
+            break
+    # Fall back to the current state.
+    try:
+        states = fetch_all_ha_states()
+    except (urllib.error.URLError, OSError, ValueError):
+        return f"Called {service} for {resolved!r}, but the state could not be fetched."
+    for entity in states:
+        if entity.get("entity_id") == resolved:
+            return _light_result(entity)
+    return f"Called {service} for {resolved!r}."
+
+
+LIGHT_NAMES = ", ".join(f"'{name}'" for name in HA_TRACKED_LIGHTS.values())
+
 TOOLS = [
     {
         "type": "function",
@@ -209,7 +420,39 @@ TOOLS = [
                 },
             },
         },
-    }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_light",
+            "description": (
+                "Turn a light on/off, set brightness or color — sends the request to the running Home Assistant instance. "
+                f"Lights: {LIGHT_NAMES}."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entity_id": {
+                        "type": "string",
+                        "description": f"The light: {LIGHT_NAMES} or its entity id.",
+                    },
+                    "state": {
+                        "type": "string",
+                        "description": "Optional: 'on' or 'off' — turn the light on or off.",
+                    },
+                    "brightness": {
+                        "type": "number",
+                        "description": "Optional: brightness 0-100 (100 = full brightness).",
+                    },
+                    "color": {
+                        "type": "string",
+                        "description": "Optional: color to set (e.g. 'white', 'red', or a hex value).",
+                    },
+                },
+                "required": ["entity_id"],
+            },
+        },
+    },
 ]
 
 
@@ -222,9 +465,16 @@ def execute_tool(tool_call):
             arguments = json.loads(arguments)
         except ValueError:
             arguments = {}
-    if name != "get_home_assistant_state":
-        return f"Error: unknown tool {name!r}."
-    return get_home_assistant_state(arguments.get("entity_id"))
+    if name == "get_home_assistant_state":
+        return get_home_assistant_state(arguments.get("entity_id"))
+    if name == "set_light":
+        return set_light(
+            arguments.get("entity_id"),
+            arguments.get("state"),
+            arguments.get("brightness"),
+            arguments.get("color"),
+        )
+    return f"Error: unknown tool {name!r}."
 
 
 # --- ollama -----------------------------------------------------------------
