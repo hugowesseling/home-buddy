@@ -1,35 +1,73 @@
 #!/usr/bin/env python3
-"""A tiny OpenAI-compatible server that streams one of three canned sentences.
+"""A small OpenAI-compatible server that proxies to ollama.
 
-Serves POST /v1/chat/completions in the standard OpenAI streaming format:
-chat.completion.chunk events sent as SSE, ending with `data: [DONE]`.
-The sentence is emitted as a few parts with ~200 ms between them to
-simulate a ~5 token/s LLM. Non-streaming requests get the full sentence
-back in a normal chat.completion JSON.
+POST /v1/chat/completions: the received text (the last user message) is
+sent to ollama's `qwen3.5:2b` with thinking disabled (`think: false`, the
+API form of `ollama run qwen3.5:2b --think=false`). With `stream: true`
+the model's reply is streamed back as standard OpenAI chunks ending with
+`data: [DONE]`; otherwise it returns a normal `chat.completion` JSON.
 """
 
 import json
-import random
 import sys
 import time
+import urllib.error
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-SENTENCES = [
-    "Hello, how are you doing?",
-    "Hi, I'm happy to be of service.",
-    "Hi there, how can I help you today?",
-]
-
-PART_INTERVAL = 0.2  # ~5 tokens per second
+OLLAMA_HOST = "http://127.0.0.1:11434"
+OLLAMA_MODEL = "qwen3.5:2b"
 CHAT_COMPLETIONS_PATHS = {"/v1/chat/completions", "/chat/completions"}
 DEFAULT_PORT = 8971
 
 
-def split_into_parts(sentence):
-    """Split a sentence into a few parts, like an LLM emitting a few tokens at a time."""
-    words = sentence.split(" ")
-    return [(" " if i else "") + word for i, word in enumerate(words)] or [sentence]
+def extract_text(body):
+    """The text to send to ollama: the last user message of the request."""
+    for message in reversed(body.get("messages") or []):
+        if isinstance(message, dict) and message.get("role") == "user":
+            content = message.get("content")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                return "".join(
+                    part.get("text", "")
+                    for part in content
+                    if isinstance(part, dict)
+                )
+    return ""
+
+
+def ollama_request(text):
+    return urllib.request.Request(
+        OLLAMA_HOST + "/api/chat",
+        data=json.dumps(
+            {
+                "model": OLLAMA_MODEL,
+                "messages": [{"role": "user", "content": text}],
+                "stream": True,
+                "think": False,
+            }
+        ).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+
+def iter_ollama_chunks(text):
+    """Yield the model's reply as it streams from ollama."""
+    with urllib.request.urlopen(ollama_request(text), timeout=300) as resp:
+        for line in resp:
+            line = line.strip()
+            if not line:
+                continue
+            event = json.loads(line)
+            message = event.get("message") or {}
+            content = message.get("content") or ""
+            if content:
+                yield content
+            if event.get("done"):
+                return
 
 
 def make_chunk(id_, created, model, delta, finish_reason=None):
@@ -65,37 +103,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(400, "Bad Request")
             return
 
-        model = str(body.get("model") or "test-model")
+        model = str(body.get("model") or OLLAMA_MODEL)
         stream = bool(body.get("stream"))
-        sentence = random.choice(SENTENCES)
+        text = extract_text(body)
 
-        if not stream:
-            completion = {
-                "id": "chatcmpl-" + uuid.uuid4().hex,
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": sentence},
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0,
-                },
-            }
-            data = json.dumps(completion).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-            return
+        if stream:
+            self._stream_from_ollama(model, text)
+        else:
+            self._completion_from_ollama(model, text)
 
+    def _stream_from_ollama(self, model, text):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -104,17 +121,13 @@ class Handler(BaseHTTPRequestHandler):
 
         rid = "chatcmpl-" + uuid.uuid4().hex
         created = int(time.time())
-        parts = split_into_parts(sentence)
-
         try:
             self._send_sse(make_chunk(rid, created, model, {"role": "assistant"}))
-            for i, part in enumerate(parts):
+            for part in iter_ollama_chunks(text):
                 self._send_sse(make_chunk(rid, created, model, {"content": part}))
-                if i != len(parts) - 1:
-                    time.sleep(PART_INTERVAL)
             self._send_sse(make_chunk(rid, created, model, {}, "stop"))
             self._write_chunk(b"data: [DONE]\n\n")
-        except OSError:
+        except (OSError, urllib.error.URLError):
             pass
         finally:
             try:
@@ -123,12 +136,45 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
+    def _completion_from_ollama(self, model, text):
+        try:
+            content = "".join(iter_ollama_chunks(text))
+        except (urllib.error.URLError, OSError) as error:
+            self.send_error(500, f"ollama call failed: {error}")
+            return
+
+        completion = {
+            "id": "chatcmpl-" + uuid.uuid4().hex,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
+        }
+        data = json.dumps(completion).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print(
-        f"OpenAI-compatible streaming server on http://127.0.0.1:{port}/v1/chat/completions",
+        f"OpenAI-compatible streaming server on http://127.0.0.1:{port}/v1/chat/completions "
+        f"(sends text to ollama {OLLAMA_MODEL} with thinking disabled)",
         flush=True,
     )
     server.serve_forever()
