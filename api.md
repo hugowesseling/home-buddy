@@ -38,7 +38,7 @@ A suitable llama.cpp backend can be started with:
   --cache-prompt --cache-ram 8192
 ```
 
-Tool results are handled directly for the action tools `set_light` and `set_disco`: the server turns the Home Assistant result into a short confirmation without asking the model for a second reply. Informational tool results (`get_home_assistant_state`) are fed back to the model for a final answer. Each model call's backend, cache counters (when available) and timings are appended to `llm.log` as `STATS` records.
+Tool results are handled directly for the action tools `set_light` and `set_disco`: the server turns the Home Assistant result into a short confirmation without asking the model for a second reply. Informational tool results (`get_home_assistant_state`) are fed back to the model for a final answer. Each model call's backend, model, finish reason and timings are appended to `llm.log` as `STATS` records. Llama.cpp also logs its build fingerprint, cached-token count and throughput; Ollama also logs its model-load and total durations.
 
 ## Streaming response (`stream: true`)
 

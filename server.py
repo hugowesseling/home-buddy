@@ -729,6 +729,8 @@ def iter_ollama_events(messages, tools=None):
                         stats[key.replace("_duration", "_ms")] = round(
                             event[key] / 1_000_000, 1
                         )
+                stats["model"] = event.get("model")
+                stats["done_reason"] = event.get("done_reason")
                 yield {"done": True, "stats": {"backend": "ollama", **stats}}
                 return
             yield event
@@ -738,15 +740,24 @@ def _llama_stats(body):
     """Map llama-server's usage/timings onto the Ollama stat names."""
     usage = body.get("usage") or {}
     timings = body.get("timings") or {}
+    choice = (body.get("choices") or [{}])[0]
     return {
         "backend": "llama",
+        "model": body.get("model"),
+        "done_reason": choice.get("finish_reason"),
+        "system_fingerprint": body.get("system_fingerprint"),
         "prompt_eval_count": usage.get("prompt_tokens")
         or timings.get("prompt_n"),
         "prompt_eval_cached_count": timings.get("cache_n"),
         "eval_count": usage.get("completion_tokens")
         or timings.get("predicted_n"),
+        "total_tokens": usage.get("total_tokens"),
         "prompt_eval_ms": round(timings.get("prompt_ms", 0), 1),
         "eval_ms": round(timings.get("predicted_ms", 0), 1),
+        "prompt_tokens_per_s": round(timings.get("prompt_per_second", 0), 1),
+        "eval_tokens_per_s": round(timings.get("predicted_per_second", 0), 1),
+        "prompt_ms_per_token": round(timings.get("prompt_per_token_ms", 0), 2),
+        "eval_ms_per_token": round(timings.get("predicted_per_token_ms", 0), 2),
     }
 
 
