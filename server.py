@@ -9,10 +9,12 @@ two ways:
    (`GET http://127.0.0.1:8123/api/states`) and adds them to the prompt as
    context (refreshed every HA_REFRESH_INTERVAL seconds, 10 minutes).
 2. Tools: the server offers the model the tools
-   `get_home_assistant_state(entity_id)` (fetch a state) and
-   `set_light(entity_id, state, brightness, color)` (turn a light on/off,
-   set brightness or color); when the model returns tool calls, the server
-   runs them and gives the results back to the model.
+   `get_home_assistant_state(entity_id)` (fetch a state),
+   `set_light(entity_id, state, brightness, color)` (control a light) and
+   `set_disco(state)` (cycle light colors). When the model returns tool
+   calls, the server runs them. Informational results are fed back to the
+   model for another round; action results are turned into a confirmation
+   directly, avoiding a second (slow) model call.
 
 With `stream: true` the final reply streams back as standard OpenAI chunks
 ending with `data: [DONE]`; otherwise it returns a `chat.completion` JSON.
@@ -519,19 +521,18 @@ def set_disco(state=None):
 
 LIGHT_NAMES = ", ".join(f"'{name}'" for name in HA_TRACKED_LIGHTS.values())
 
+# Tool schemas are part of every prompt Ollama evaluates. Keep them small:
+# uncached prompt tokens are evaluated on the CPU at roughly 18 ms/token here.
 TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "get_home_assistant_state",
-            "description": "Fetch the current state of a Home Assistant entity from the running Home Assistant instance.",
+            "description": "Fetch a Home Assistant entity's current state.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "entity_id": {
-                        "type": "string",
-                        "description": "Entity id or name of the entity to fetch, e.g. the battery SoC.",
-                    }
+                    "entity_id": {"type": "string", "description": "Entity id or name."},
                 },
             },
         },
@@ -540,29 +541,14 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "set_light",
-            "description": (
-                "Turn a light on/off, set brightness or color — sends the request to the running Home Assistant instance. "
-                f"Lights: {LIGHT_NAMES}."
-            ),
+            "description": f"Control a light (on/off, brightness 0-100, color). Lights: {LIGHT_NAMES}.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "entity_id": {
-                        "type": "string",
-                        "description": f"The light: {LIGHT_NAMES} or its entity id.",
-                    },
-                    "state": {
-                        "type": "string",
-                        "description": "Optional: 'on' or 'off' — turn the light on or off.",
-                    },
-                    "brightness": {
-                        "type": "number",
-                        "description": "Optional: brightness 0-100 (100 = full brightness).",
-                    },
-                    "color": {
-                        "type": "string",
-                        "description": "Optional: color to set (e.g. 'white', 'red', or a hex value).",
-                    },
+                    "entity_id": {"type": "string", "description": "Name from the list or an entity id."},
+                    "state": {"type": "string", "description": "'on' or 'off'."},
+                    "brightness": {"type": "number", "description": "0-100."},
+                    "color": {"type": "string", "description": "Color name or hex."},
                 },
                 "required": ["entity_id"],
             },
@@ -572,17 +558,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "set_disco",
-            "description": (
-                "Turn disco mode on/off: when on, the server continuously changes the colors "
-                "of every individual light every ~0.5s; when off, the lights revert to their original colors."
-            ),
+            "description": "Turn disco mode on/off (cycles light colors every ~0.5s; off restores them).",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "state": {
-                        "type": "string",
-                        "description": "Optional: 'on' or 'off' — turn disco mode on or off.",
-                    },
+                    "state": {"type": "string", "description": "'on' or 'off'."},
                 },
             },
         },
@@ -611,6 +591,55 @@ def execute_tool(tool_call):
     if name == "set_disco":
         return set_disco(arguments.get("state"))
     return f"Error: unknown tool {name!r}."
+
+
+def _brightness_percent(value):
+    """Home Assistant reports brightness on 0-255; users think in 0-100."""
+    try:
+        return int(round(float(value) / 2.55))
+    except (TypeError, ValueError):
+        return None
+
+
+def tool_result_reply(results):
+    """Build a reply from action-tool results, or None if the model must run again.
+
+    Asking the 2B model to rephrase a successful set_light/set_disco result costs
+    another full prompt evaluation (~6 s here), so answer directly. Informational
+    tools still need a second model round to interpret their results.
+    """
+    parts = []
+    for tool_call, result in results:
+        name = (tool_call.get("function") or {}).get("name", "")
+        if name not in ("set_light", "set_disco"):
+            return None
+        try:
+            data = json.loads(result)
+        except (TypeError, ValueError):
+            data = None
+        if not isinstance(data, dict):
+            parts.append(result)
+            continue
+        if name == "set_disco":
+            if data.get("disco") == "on":
+                parts.append("Disco mode is on.")
+            else:
+                parts.append("Disco mode is off.")
+                if data.get("restored"):
+                    parts[-1] += f" Restored {len(data['restored'])} light(s)."
+            continue
+        light = data.get("name") or "Light"
+        if data.get("state") == "off":
+            parts.append(f"Turned {light} off.")
+            continue
+        brightness = _brightness_percent(data.get("brightness"))
+        if brightness is not None:
+            parts.append(f"Set {light} to {brightness}%.")
+        elif data.get("state") == "on":
+            parts.append(f"Turned {light} on.")
+        else:
+            parts.append(f"Set {light}.")
+    return " ".join(parts) if parts else None
 
 
 # --- ollama -----------------------------------------------------------------
@@ -649,6 +678,26 @@ def iter_ollama_events(messages, tools=None):
                 continue
             event = json.loads(line)
             if event.get("done"):
+                stats = {
+                    key: event[key]
+                    for key in (
+                        "prompt_eval_count",
+                        "prompt_eval_cached_count",
+                        "eval_count",
+                    )
+                    if key in event
+                }
+                for key in (
+                    "total_duration",
+                    "load_duration",
+                    "prompt_eval_duration",
+                    "eval_duration",
+                ):
+                    if key in event:
+                        stats[key.replace("_duration", "_ms")] = round(
+                            event[key] / 1_000_000, 1
+                        )
+                log_llm("STATS", stats)
                 return
             yield event
 
@@ -742,10 +791,17 @@ class Handler(BaseHTTPRequestHandler):
                 ollama_messages = ollama_messages + [
                     {"role": "assistant", "content": "", "tool_calls": tool_calls}
                 ]
+                results = []
                 for tool_call in tool_calls:
                     result = execute_tool(tool_call)
+                    results.append((tool_call, result))
                     ollama_messages.append({"role": "tool", "content": result})
                     log_llm("TOOL", {"call": tool_call, "result": result})
+                reply = tool_result_reply(results)
+                if reply is not None:
+                    sink(reply)
+                    log_llm("REPLY", {"content": reply})
+                    break
         except (OSError, urllib.error.URLError):
             pass
 

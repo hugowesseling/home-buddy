@@ -27,6 +27,8 @@ The HA API is authenticated with the long-lived token in `ha_token` (or the `HA_
 
 `messages` and any other extra fields are optional and ignored.
 
+Tool results are handled directly for the action tools `set_light` and `set_disco`: the server turns the Home Assistant result into a short confirmation without asking the model for a second reply. Informational tool results (`get_home_assistant_state`) are fed back to the model for a final answer. Each model call's Ollama cache counters and timings are appended to `llm.log` as `STATS` records.
+
 ## Streaming response (`stream: true`)
 
 `Content-Type: text/event-stream`, standard OpenAI-compatible stream of the model's reply:
