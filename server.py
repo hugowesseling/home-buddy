@@ -20,7 +20,9 @@ ending with `data: [DONE]`; otherwise it returns a `chat.completion` JSON.
 
 import json
 import os
+import random
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -402,6 +404,119 @@ def set_light(entity_id=None, state=None, brightness=None, color=None):
     return f"Called {service} for {resolved!r}."
 
 
+disco_state = {
+    "enabled": False,
+    "stop_event": None,
+    "original_states": {},
+}
+
+
+def _individual_lights():
+    """All `light.*` entities that are not groups (the disco doesn't use the groups)."""
+    try:
+        states = fetch_all_ha_states()
+    except (urllib.error.URLError, OSError, ValueError):
+        return []
+    return [
+        entity
+        for entity in states
+        if entity.get("entity_id", "").startswith("light.")
+        and not isinstance((entity.get("attributes") or {}).get("entity_id"), list)
+    ]
+
+
+def _random_rgb_colors(count):
+    """Generate `count` distinct random [r, g, b] colors."""
+    colors = []
+    seen = set()
+    for _ in range(count * 50):
+        if len(colors) >= count:
+            break
+        rgb = random.randrange(0x1000000)
+        if rgb in seen:
+            continue
+        seen.add(rgb)
+        colors.append([(rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF])
+    return colors
+
+
+def _start_disco():
+    """Start the disco: remember the lights' states, then change colors every ~0.5s."""
+    if disco_state["enabled"]:
+        return
+    original = {}
+    for entity in _individual_lights():
+        attributes = entity.get("attributes") or {}
+        original[entity.get("entity_id")] = {
+            "state": entity.get("state"),
+            "rgb_color": attributes.get("rgb_color"),
+        }
+    disco_state["original_states"] = original
+    stop = threading.Event()
+    disco_state["stop_event"] = stop
+    disco_state["enabled"] = True
+
+    def loop():
+        while not stop.is_set():
+            try:
+                lights = _individual_lights()
+                colors = _random_rgb_colors(len(lights))
+                for entity, rgb in zip(lights, colors):
+                    _ha_service_call(
+                        "light/turn_on",
+                        {"entity_id": entity.get("entity_id"), "rgb_color": rgb},
+                    )
+            except Exception:
+                pass
+            stop.wait(0.5)
+
+    threading.Thread(target=loop, daemon=True).start()
+
+
+def _stop_disco():
+    """Stop the disco and restore the lights to their original states. Returns restored ids."""
+    if not disco_state["enabled"]:
+        return []
+    stop = disco_state["stop_event"]
+    disco_state["enabled"] = False
+    if stop is not None:
+        stop.set()
+    original = disco_state["original_states"]
+    disco_state["original_states"] = {}
+    restored = []
+    for entity_id, info in original.items():
+        try:
+            if info.get("state") == "off":
+                _ha_service_call("light/turn_off", {"entity_id": entity_id})
+            else:
+                data = {"entity_id": entity_id}
+                if info.get("rgb_color"):
+                    data["rgb_color"] = info["rgb_color"]
+                _ha_service_call("light/turn_on", data)
+            restored.append(entity_id)
+        except Exception:
+            pass
+    return restored
+
+
+def set_disco(state=None):
+    """Tool executor: turn disco mode on/off (changing light colors continuously)."""
+    action = (state or "").strip().lower()
+    if action in ("on", "start", "enable"):
+        lights = _individual_lights()
+        _start_disco()
+        return json.dumps(
+            {
+                "disco": "on",
+                "individual_lights": [entity.get("entity_id") for entity in lights],
+            }
+        )
+    if action in ("off", "stop", "disable"):
+        restored = _stop_disco()
+        return json.dumps({"disco": "off", "restored": restored})
+    return "Error: state must be 'on' or 'off'."
+
+
 LIGHT_NAMES = ", ".join(f"'{name}'" for name in HA_TRACKED_LIGHTS.values())
 
 TOOLS = [
@@ -453,6 +568,25 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_disco",
+            "description": (
+                "Turn disco mode on/off: when on, the server continuously changes the colors "
+                "of every individual light every ~0.5s; when off, the lights revert to their original colors."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "state": {
+                        "type": "string",
+                        "description": "Optional: 'on' or 'off' — turn disco mode on or off.",
+                    },
+                },
+            },
+        },
+    },
 ]
 
 
@@ -474,6 +608,8 @@ def execute_tool(tool_call):
             arguments.get("brightness"),
             arguments.get("color"),
         )
+    if name == "set_disco":
+        return set_disco(arguments.get("state"))
     return f"Error: unknown tool {name!r}."
 
 
