@@ -751,7 +751,8 @@ def _llama_stats(body):
         "prompt_eval_cached_count": timings.get("cache_n"),
         "eval_count": usage.get("completion_tokens")
         or timings.get("predicted_n"),
-        "total_tokens": usage.get("total_tokens"),
+        "total_tokens": usage.get("total_tokens")
+        or (timings.get("prompt_n", 0) + timings.get("predicted_n", 0)),
         "prompt_eval_ms": round(timings.get("prompt_ms", 0), 1),
         "eval_ms": round(timings.get("predicted_ms", 0), 1),
         "prompt_tokens_per_s": round(timings.get("prompt_per_second", 0), 1),
@@ -762,16 +763,16 @@ def _llama_stats(body):
 
 
 def iter_llama_events(messages, tools=None):
-    """Call llama-server's OpenAI-compatible endpoint and yield message events.
+    """Call llama-server's OpenAI-compatible endpoint and stream message events.
 
-    The response is requested non-streaming; one content chunk is enough for
-    this server's short replies and avoids having to reassemble fragmented
-    tool-call arguments from llama.cpp's SSE stream.
+    Content deltas are yielded immediately. Tool calls arrive as index-keyed
+    argument fragments, so they are reassembled and yielded once at the end.
     """
     payload = {
         "model": LLAMA_MODEL,
         "messages": messages,
-        "stream": False,
+        "stream": True,
+        "stream_options": {"include_usage": True},
         # Greedy decoding: Q4_K_M at temperature 1 sometimes answers in prose
         # instead of emitting the expected tool call. Set LLAMA_TEMPERATURE to
         # override if a different sampling behaviour is wanted.
@@ -785,10 +786,59 @@ def iter_llama_events(messages, tools=None):
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
+    tool_calls = {}
+    finish_reason = None
+    meta = {}
     with urllib.request.urlopen(req, timeout=300) as resp:
-        body = json.load(resp)
-    choice = (body.get("choices") or [{}])[0]
-    yield {"message": choice.get("message") or {}}
+        for line in resp:
+            line = line.strip()
+            if not line.startswith(b"data:"):
+                continue
+            raw = line[5:].strip()
+            if raw == b"[DONE]":
+                break
+            chunk = json.loads(raw)
+            for key in ("model", "system_fingerprint"):
+                if chunk.get(key):
+                    meta[key] = chunk[key]
+            if "usage" in chunk or "timings" in chunk:
+                meta["usage"] = chunk.get("usage", meta.get("usage"))
+                meta["timings"] = chunk.get("timings", meta.get("timings"))
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            choice = choices[0]
+            if choice.get("finish_reason"):
+                finish_reason = choice["finish_reason"]
+            delta = choice.get("delta") or {}
+            content = delta.get("content")
+            if content:
+                yield {"message": {"content": content}}
+            for call in delta.get("tool_calls") or []:
+                index = call.get("index", 0)
+                entry = tool_calls.setdefault(
+                    index, {"type": "function", "function": {}}
+                )
+                for key in ("id", "type"):
+                    if call.get(key):
+                        entry[key] = call[key]
+                function = call.get("function") or {}
+                if function.get("name"):
+                    entry["function"]["name"] = function["name"]
+                if function.get("arguments"):
+                    entry["function"]["arguments"] = (
+                        entry["function"].get("arguments", "")
+                        + function["arguments"]
+                    )
+    if tool_calls:
+        yield {"message": {"tool_calls": [tool_calls[i] for i in sorted(tool_calls)]}}
+    body = {
+        "model": meta.get("model"),
+        "system_fingerprint": meta.get("system_fingerprint"),
+        "choices": [{"finish_reason": finish_reason}],
+        "usage": meta.get("usage") or {},
+        "timings": meta.get("timings") or {},
+    }
     yield {"done": True, "stats": _llama_stats(body)}
 
 
@@ -806,12 +856,11 @@ def iter_model_events(messages, tools=None):
 
 
 def run_model(messages, sink):
-    """Call the model; return the tool calls.
+    """Call the model; stream content to sink as it arrives; return tool calls.
 
-    Content is buffered until the round finishes: when the model emits tool
-    calls, its "I will now..." preamble is not part of the answer. The caller
-    supplies the final reply (deterministically for action tools, or via the
-    next model round for informational tools).
+    Content is forwarded immediately, including any preamble before a tool
+    call. The caller still supplies the final reply for action tools, and the
+    next model round handles informational tools.
     """
     tool_calls = []
     content_parts = []
@@ -824,12 +873,11 @@ def run_model(messages, sink):
         content = (message.get("content") or "").replace("**", "")
         if content:
             content_parts.append(content)
+            if sink:
+                sink(content)
         if message.get("tool_calls"):
             tool_calls.extend(message["tool_calls"])
     log_llm("RESPONSE", {"content": "".join(content_parts), "tool_calls": tool_calls})
-    if not tool_calls and sink:
-        for part in content_parts:
-            sink(part)
     return tool_calls
 
 

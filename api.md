@@ -51,6 +51,8 @@ Tool results are handled directly for the action tools `set_light` and `set_disc
 
 Each event is sent as `data: <json>\n\n`, where each JSON object is a `chat.completion.chunk` (with `id`, `object`, `created`, `model`, and `choices: [{index, delta, finish_reason}]`).
 
+Content is forwarded token-by-token as it arrives. If the model writes a preamble before a tool call, that text is streamed too, followed by the tool's deterministic confirmation.
+
 ## Non-streaming response (default)
 
 A standard `chat.completion` JSON object; the model's reply is in `choices[0].message.content` as a single string.
