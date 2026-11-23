@@ -16,7 +16,7 @@ Send a JSON body in the standard OpenAI chat completions shape:
 }
 ```
 
-The last user message is sent to `qwen3.5:2b` with thinking disabled, along with a short static instruction: the state block is reference data, use the tools to carry out the user's request, refer to entities by the exact ids or names shown, and never repeat a tool call. The model acts on whatever comes last, so the state block is placed before the user's request. By default the server talks to a local llama.cpp `llama-server` and falls back to ollama if it is unavailable. Configure this with `LLM_BACKEND=auto|llama|ollama`, `LLAMA_HOST` (default `http://127.0.0.1:18080`), `LLAMA_MODEL` (default `qwen3.5:2b`) and `LLAMA_TEMPERATURE` (default `0`). `OLLAMA_HOST` defaults to `http://127.0.0.1:11434`.
+The last user message is sent to `qwen3.5:2b` with thinking disabled, along with a short static instruction: the state block is reference data, use the tools to carry out the user's request, refer to entities by the exact ids or names shown, and never repeat a tool call. The model acts on whatever comes last, so the state block is placed before the user's request. The server talks to a local llama.cpp `llama-server`; configure it with `LLAMA_HOST` (default `http://127.0.0.1:18080`), `LLAMA_MODEL` (default `qwen3.5:2b`) and `LLAMA_TEMPERATURE` (default `0`).
 
 The model gets Home Assistant state two ways:
 
@@ -38,7 +38,7 @@ A suitable llama.cpp backend can be started with:
   --cache-prompt --cache-ram 8192
 ```
 
-Repeated identical tool calls are detected and stopped to prevent loops; if no answer is produced, a short fallback reply is returned. Tool results are handled directly for the action tools `set_light` and `set_disco`: the server turns the Home Assistant result into a short confirmation without asking the model for a second reply. Informational tool results (`get_home_assistant_state`) are fed back to the model for a final answer. Each model call's backend, model, finish reason and timings are appended to `llm.log` as `STATS` records. Llama.cpp also logs its build fingerprint, cached-token count and throughput; Ollama also logs its model-load and total durations.
+Repeated identical tool calls are detected and stopped to prevent loops; if no answer is produced, a short fallback reply is returned. Tool results are handled directly for the action tools `set_light` and `set_disco`: the server turns the Home Assistant result into a short confirmation without asking the model for a second reply. Informational tool results (`get_home_assistant_state`) are fed back to the model for a final answer. Each model call's backend, model, finish reason and timings are appended to `llm.log` as `STATS` records. Llama.cpp also logs its build fingerprint, cached-token count and throughput.
 
 ## Streaming response (`stream: true`)
 

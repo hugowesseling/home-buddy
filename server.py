@@ -2,9 +2,8 @@
 """A small OpenAI-compatible server that proxies to llama.cpp and Home Assistant.
 
 POST /v1/chat/completions: the received text is sent to `qwen3.5:2b` with
-thinking disabled. By default llama.cpp's OpenAI-compatible endpoint is used,
-falling back to ollama if it is unavailable. The model gets Home Assistant state
-two ways:
+thinking disabled through llama.cpp's OpenAI-compatible endpoint. The model gets
+Home Assistant state two ways:
 
 1. Prompt states: the server fetches the states of relevant HA entities
    (`GET http://127.0.0.1:8123/api/states`) and adds them to the prompt as
@@ -44,12 +43,8 @@ def _endpoint(value, default):
     return value.rstrip("/")
 
 
-OLLAMA_HOST = _endpoint(os.environ.get("OLLAMA_HOST"), "http://127.0.0.1:11434")
-OLLAMA_MODEL = "qwen3.5:2b"
 LLAMA_HOST = _endpoint(os.environ.get("LLAMA_HOST"), "http://127.0.0.1:18080")
-LLAMA_MODEL = os.environ.get("LLAMA_MODEL", OLLAMA_MODEL)
-# auto: try llama.cpp first, then ollama. llama/ollama force one backend.
-LLM_BACKEND = os.environ.get("LLM_BACKEND", "auto").strip().lower()
+LLAMA_MODEL = os.environ.get("LLAMA_MODEL", "qwen3.5:2b")
 HA_BASE_URL = "http://127.0.0.1:8123"
 HA_TOKEN_FILE = Path("ha_token")  # HA long-lived access token for the API
 HA_REFRESH_INTERVAL = 600  # 10 minutes
@@ -593,7 +588,7 @@ SYSTEM_PROMPT = (
 
 FALLBACK_REPLY = "Sorry, I couldn't work out how to do that."
 
-# Tool schemas are part of every prompt Ollama evaluates. Keep them small:
+# Tool schemas are part of every prompt llama-server evaluates. Keep them small:
 # uncached prompt tokens are evaluated on the CPU at roughly 18 ms/token here.
 TOOLS = [
     {
@@ -734,57 +729,8 @@ def log_llm(tag, data):
         pass
 
 
-def iter_ollama_events(messages, tools=None):
-    """Call ollama /api/chat (streaming) and yield normalized message events."""
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": messages,
-        "stream": True,
-        "think": False,
-    }
-    if tools:
-        payload["tools"] = tools
-    log_llm("REQUEST", {"backend": "ollama", **payload})
-    req = urllib.request.Request(
-        OLLAMA_HOST + "/api/chat",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        for line in resp:
-            line = line.strip()
-            if not line:
-                continue
-            event = json.loads(line)
-            if event.get("done"):
-                stats = {
-                    key: event[key]
-                    for key in (
-                        "prompt_eval_count",
-                        "prompt_eval_cached_count",
-                        "eval_count",
-                    )
-                    if key in event
-                }
-                for key in (
-                    "total_duration",
-                    "load_duration",
-                    "prompt_eval_duration",
-                    "eval_duration",
-                ):
-                    if key in event:
-                        stats[key.replace("_duration", "_ms")] = round(
-                            event[key] / 1_000_000, 1
-                        )
-                stats["model"] = event.get("model")
-                stats["done_reason"] = event.get("done_reason")
-                yield {"done": True, "stats": {"backend": "ollama", **stats}}
-                return
-            yield event
-
-
 def _llama_stats(body):
-    """Map llama-server's usage/timings onto the Ollama stat names."""
+    """Extract llama-server's usage/timings for logging."""
     usage = body.get("usage") or {}
     timings = body.get("timings") or {}
     choice = (body.get("choices") or [{}])[0]
@@ -889,19 +835,6 @@ def iter_llama_events(messages, tools=None):
     yield {"done": True, "stats": _llama_stats(body)}
 
 
-def iter_model_events(messages, tools=None):
-    """Use llama.cpp when available, falling back to ollama in auto mode."""
-    if LLM_BACKEND in ("auto", "llama"):
-        try:
-            yield from iter_llama_events(messages, tools)
-            return
-        except (OSError, urllib.error.URLError) as error:
-            if LLM_BACKEND == "llama":
-                raise
-            log_llm("FALLBACK", {"from": "llama", "to": "ollama", "error": str(error)})
-    yield from iter_ollama_events(messages, tools)
-
-
 def run_model(messages, sink):
     """Call the model; stream content to sink as it arrives; return tool calls.
 
@@ -911,7 +844,7 @@ def run_model(messages, sink):
     """
     tool_calls = []
     content_parts = []
-    for event in iter_model_events(messages, TOOLS):
+    for event in iter_llama_events(messages, TOOLS):
         if event.get("done"):
             if event.get("stats"):
                 log_llm("STATS", event["stats"])
@@ -961,7 +894,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(400, "Bad Request")
             return
 
-        model = str(body.get("model") or OLLAMA_MODEL)
+        model = str(body.get("model") or LLAMA_MODEL)
         stream = bool(body.get("stream"))
         user_messages = [
             message
@@ -1087,14 +1020,10 @@ def main():
         cached_ha_states()  # warm the HA state cache at startup
     except Exception:
         pass
-    backend = {
-        "auto": f"llama.cpp ({LLAMA_HOST}) -> ollama ({OLLAMA_HOST})",
-        "llama": f"llama.cpp ({LLAMA_HOST})",
-        "ollama": f"ollama ({OLLAMA_HOST})",
-    }.get(LLM_BACKEND, f"unknown LLM_BACKEND={LLM_BACKEND!r}")
     print(
         f"OpenAI-compatible streaming server on http://127.0.0.1:{port}/v1/chat/completions "
-        f"(model {OLLAMA_MODEL}, thinking disabled; backend: {backend}; HA states from {HA_BASE_URL})",
+        f"(model {LLAMA_MODEL}, thinking disabled; llama.cpp at {LLAMA_HOST}; "
+        f"HA states from {HA_BASE_URL})",
         flush=True,
     )
     server.serve_forever()
