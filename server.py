@@ -184,23 +184,29 @@ def ha_context():
     states = cached_ha_states()
     if not states:
         return ""
-    lines = ["Home Assistant state (current):"]
+    lines = ["<home_state>"]
     for entity in states:
-        name = HA_TRACKED_ENTITIES.get(entity.get("entity_id", ""))
+        entity_id = entity.get("entity_id", "")
+        name = HA_TRACKED_ENTITIES.get(entity_id)
         if name:
             unit = HA_UNITS.get(name)
             value = entity.get("state", "")
             if unit:
                 value = f"{value} {unit}"
-            lines.append(f"- {name}: {value}")
+            # Include the real entity id: the friendly label alone does not
+            # resolve to the HA entity (e.g. "state of the heatpump" lives at
+            # sensor.home_energy_manager_state).
+            lines.append(f"{entity_id} ({name}): {value}")
+    lines.append("</home_state>")
     return "\n".join(lines)
 
 
 def with_ha_context(messages, context):
-    """Append HA context to the last user message.
+    """Prepend HA context to the last user message, leaving the request last.
 
-    Keeping these fast-changing values at the very end of the prompt lets
-    llama.cpp reuse the cached prefix when the state refreshes.
+    The model acts on whatever comes last in the prompt, so the user's request
+    must follow the state block. Keeping both in the same trailing user message
+    still lets llama.cpp reuse the cached prefix when the state refreshes.
     """
     if not context:
         return messages
@@ -208,7 +214,7 @@ def with_ha_context(messages, context):
     for index in range(len(result) - 1, -1, -1):
         if result[index].get("role") == "user":
             content = result[index].get("content") or ""
-            result[index]["content"] = f"{content}\n\n{context}" if content else context
+            result[index]["content"] = f"{context}\n\n{content}" if content else context
             return result
     return result + [{"role": "user", "content": context}]
 
@@ -222,29 +228,51 @@ def _entity_json(entity):
         if key != "friendly_name"
     }
     return json.dumps(
-        {"name": name, "state": entity.get("state"), "attributes": attributes}
+        {
+            "entity_id": entity_id,
+            "name": name,
+            "state": entity.get("state"),
+            "attributes": attributes,
+        }
     )
 
 
-def get_home_assistant_state(entity_id=None):
-    """Tool executor: return the JSON of the requested HA entity's state."""
+def _get_entity_by_id(entity_id):
+    """Fetch one entity by id; return JSON, an error string, or None if absent."""
     token = ha_token()
-    if token is None:
-        return "Error: no Home Assistant access token available."
-    name = (entity_id or "").strip() or DEFAULT_ENTITY
     try:
         req = urllib.request.Request(
-            HA_BASE_URL + "/api/states/" + urllib.parse.quote(name, safe=""),
+            HA_BASE_URL + "/api/states/" + urllib.parse.quote(entity_id, safe=""),
             headers={"Authorization": f"Bearer {token}"},
         )
         with urllib.request.urlopen(req, timeout=20) as resp:
             return _entity_json(json.loads(resp.read()))
     except urllib.error.HTTPError as error:
         if error.code != 404:
-            return f"Error: fetching {name!r} failed (HTTP {error.code})."
+            return f"Error: fetching {entity_id!r} failed (HTTP {error.code})."
     except (urllib.error.URLError, OSError, ValueError) as error:
-        return f"Error: fetching {name!r} failed: {error}"
-    # The name isn't a live entity id; resolve it against the full states list.
+        return f"Error: fetching {entity_id!r} failed: {error}"
+    return None
+
+
+def get_home_assistant_state(entity_id=None):
+    """Tool executor: return the JSON of the requested HA entity's state."""
+    if ha_token() is None:
+        return "Error: no Home Assistant access token available."
+    name = (entity_id or "").strip() or DEFAULT_ENTITY
+    result = _get_entity_by_id(name)
+    if result is not None:
+        return result
+    # Labels from our own state block (e.g. "state of the heatpump") are not
+    # HA entity ids. Resolve them through the tracked-entity mapping first.
+    for tracked_id, label in HA_TRACKED_ENTITIES.items():
+        if _strong_name_match(
+            {"entity_id": tracked_id, "attributes": {"friendly_name": label}}, name
+        ):
+            result = _get_entity_by_id(tracked_id)
+            if result is not None:
+                return result
+    # Last resort: fuzzy match against every HA entity.
     try:
         matches = [
             entity
@@ -553,6 +581,18 @@ def set_disco(state=None):
 
 LIGHT_NAMES = ", ".join(f"'{name}'" for name in HA_TRACKED_LIGHTS.values())
 
+# Static instruction; it sits in the cached prefix so it costs nothing per
+# request after the first.
+SYSTEM_PROMPT = (
+    "You control a Home Assistant home.\n"
+    "- The <home_state> block is reference data, not a request.\n"
+    "- Use the tools to carry out the user's request.\n"
+    "- Refer to entities by the exact ids or names shown.\n"
+    "- Never call the same tool with the same arguments twice."
+)
+
+FALLBACK_REPLY = "Sorry, I couldn't work out how to do that."
+
 # Tool schemas are part of every prompt Ollama evaluates. Keep them small:
 # uncached prompt tokens are evaluated on the CPU at roughly 18 ms/token here.
 TOOLS = [
@@ -560,7 +600,10 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_home_assistant_state",
-            "description": "Fetch a Home Assistant entity's current state.",
+            "description": (
+                "Fetch a Home Assistant entity's current state. "
+                "Use only for values not already provided in home_state."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -573,7 +616,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "set_light",
-            "description": f"Control a light (on/off, brightness 0-100, color). Lights: {LIGHT_NAMES}.",
+            "description": (
+                "Control a light (on/off, brightness 0-100, color). "
+                "Use for requests about lighting, brightness or visibility. "
+                f"Lights: {LIGHT_NAMES}."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -922,7 +969,9 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(message, dict)
         ]
 
-        messages = with_ha_context(user_messages, ha_context())
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + with_ha_context(
+            user_messages, ha_context()
+        )
 
         rid = "chatcmpl-" + uuid.uuid4().hex
         created = int(time.time())
@@ -943,24 +992,51 @@ class Handler(BaseHTTPRequestHandler):
             self._send_sse(make_chunk(rid, created, model, {"role": "assistant"}))
 
         try:
+            seen_calls = set()
+            replied = False
             for _ in range(MAX_TOOL_ROUNDS):
                 tool_calls = run_model(messages, sink)
                 if not tool_calls:
+                    replied = True
+                    break
+                fresh = []
+                for tool_call in tool_calls:
+                    function = tool_call.get("function") or {}
+                    arguments = function.get("arguments")
+                    if not isinstance(arguments, str):
+                        arguments = json.dumps(arguments, sort_keys=True)
+                    key = (function.get("name"), arguments)
+                    if key in seen_calls:
+                        log_llm("LOOP", {"duplicate": tool_call})
+                        continue
+                    seen_calls.add(key)
+                    fresh.append(tool_call)
+                if not fresh:
                     break
                 messages = messages + [
-                    {"role": "assistant", "content": "", "tool_calls": tool_calls}
+                    {"role": "assistant", "content": "", "tool_calls": fresh}
                 ]
                 results = []
-                for tool_call in tool_calls:
+                for tool_call in fresh:
                     result = execute_tool(tool_call)
                     results.append((tool_call, result))
-                    messages.append({"role": "tool", "content": result})
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.get("id"),
+                            "content": result,
+                        }
+                    )
                     log_llm("TOOL", {"call": tool_call, "result": result})
                 reply = tool_result_reply(results)
                 if reply is not None:
                     sink(reply)
                     log_llm("REPLY", {"content": reply})
+                    replied = True
                     break
+            if not replied:
+                sink(FALLBACK_REPLY)
+                log_llm("REPLY", {"content": FALLBACK_REPLY, "fallback": True})
         except (OSError, urllib.error.URLError) as error:
             log_llm("ERROR", {"error": str(error)})
 
