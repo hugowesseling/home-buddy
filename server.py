@@ -436,9 +436,11 @@ def set_light(entity_id=None, state=None, brightness=None, color=None):
     if _ha_service_call(service, data) is None:
         return f"Error: could not call the HA service for {resolved!r}."
     # Poll briefly for the new state (HA applies service calls asynchronously).
+    # HA state fetches take only a few milliseconds, so a short interval keeps
+    # the added latency low without hammering the API.
     expected = "off" if service == "light/turn_off" else "on"
-    for _ in range(20):
-        time.sleep(0.5)
+    for _ in range(40):
+        time.sleep(0.05)
         try:
             states = fetch_all_ha_states()
         except (urllib.error.URLError, OSError, ValueError):

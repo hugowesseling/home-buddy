@@ -11,7 +11,17 @@ A small OpenAI-compatible chat API that answers questions about your home and co
 ## Setup
 
 1. Put your Home Assistant long-lived token in a `ha_token` file in this directory (gitignored), or set the `HA_TOKEN` environment variable.
-2. Start llama.cpp with the tuned command in [api.md](api.md).
+2. Keep llama.cpp resident with the included systemd user unit. It locks the model in RAM and restarts automatically if the process dies:
+
+   ```bash
+   loginctl enable-linger "$USER"   # once, so the service survives logout
+   mkdir -p ~/.config/systemd/user
+   cp llama-server.service ~/.config/systemd/user/
+   systemctl --user daemon-reload
+   systemctl --user enable --now llama-server.service
+   ```
+
+   The raw command and tuning notes are in [api.md](api.md).
 3. Start the server (port 8971 by default):
 
    ```bash

@@ -1,0 +1,13 @@
+[Unit]
+Description=llama.cpp server for home-buddy (qwen3.5:2b Q4_K_M)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/hugowesseling/llm/llama.cpp/build/bin/llama-server -m /home/hugowesseling/llm/models/Qwen3.5-2B-Q4_K_M.gguf --host 127.0.0.1 --port 18080 --alias qwen3.5:2b --ctx-size 4096 --parallel 1 --reasoning off --no-webui --threads 8 --threads-batch 8 -b 2048 -ub 512 --cache-prompt --cache-ram 8192 --load-mode mmap+mlock
+Restart=always
+RestartSec=2
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=default.target
