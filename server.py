@@ -65,6 +65,22 @@ HA_TRACKED_LIGHTS = {
     "light.kajplats_e27_cws_globe_1055lm": "Living room light",
     "light.kajplats_e27_cws_globe_1055lm_2": "Dining room light",
 }
+# Friendly names for sensors the model may be asked about. Included in the
+# get_home_assistant_state tool description so it can pass exact entity ids
+# instead of guessing, and used below to resolve near-miss ids.
+KNOWN_SENSORS = {
+    "living room temperature": "sensor.living_room_tuya_temperature",
+    "living room humidity": "sensor.living_room_tuya_humidity",
+    "upstairs temperature": "sensor.upstairs_tuya_temperature",
+    "upstairs humidity": "sensor.upstairs_tuya_humidity",
+    "outdoor temperature": "sensor.home_outdoor_temperature",
+    "hot water tank temperature": "sensor.home_domestic_hot_water_0_tank_temperature",
+    "battery temperature": "sensor.saj_battery_temperature",
+    "inverter temperature": "sensor.saj_inverter_temperature",
+    "system flow temperature": "sensor.home_system_flow_temperature",
+}
+# HA_TRACKED_ENTITIES are deliberately omitted: their values are already in
+# home_state, so listing them here tempts the model into a redundant tool round.
 DEFAULT_ENTITY = "Battery 1 SOC"
 MAX_TOOL_ROUNDS = 5
 CHAT_COMPLETIONS_PATHS = {"/v1/chat/completions", "/chat/completions"}
@@ -82,6 +98,18 @@ def entity_matches(entity, names):
         (entity.get("attributes") or {}).get("friendly_name", "")
     )
     return any(_normalize(name) in haystack for name in names)
+
+
+def _canonical_name(text):
+    """Stable key for matching near-miss entity ids (drops vendor/prefix words).
+
+    e.g. both 'sensor.upstairs_humidity' and 'sensor.upstairs_tuya_humidity'
+    reduce to 'upstairs humidity', so a small model's invented id still resolves.
+    """
+    value = _normalize(text)
+    for word in ("sensor", "binary", "tuya", "saj", "home", "light"):
+        value = value.replace(word, "")
+    return value
 
 
 def _strong_name_match(entity, name):
@@ -267,15 +295,27 @@ def get_home_assistant_state(entity_id=None):
             result = _get_entity_by_id(tracked_id)
             if result is not None:
                 return result
-    # Last resort: fuzzy match against every HA entity.
+    # Curated names shown to the model in the tool description.
+    key = _canonical_name(name)
+    if key:
+        for label, entity_id in KNOWN_SENSORS.items():
+            if _canonical_name(label) == key:
+                result = _get_entity_by_id(entity_id)
+                if result is not None:
+                    return result
+    # Last resort: match against every HA entity. Canonical equality catches
+    # invented ids like 'sensor.living_room_humidity'; _strong_name_match still
+    # covers free-form phrases.
     try:
-        matches = [
-            entity
-            for entity in fetch_all_ha_states()
-            if _strong_name_match(entity, name)
-        ]
+        states = fetch_all_ha_states()
     except (urllib.error.URLError, OSError, ValueError):
         return "Error: could not fetch Home Assistant states."
+    canonical_matches = [
+        entity for entity in states if _canonical_name(entity.get("entity_id", "")) == key
+    ]
+    if len(canonical_matches) == 1:
+        return _entity_json(canonical_matches[0])
+    matches = [entity for entity in states if _strong_name_match(entity, name)]
     for entity in matches:
         if entity.get("entity_id") in HA_TRACKED_ENTITIES:
             return _entity_json(entity)
@@ -577,6 +617,11 @@ def set_disco(state=None):
 
 
 LIGHT_NAMES = ", ".join(f"'{name}'" for name in HA_TRACKED_LIGHTS.values())
+# Keep this compact: a multi-line list in the tool description changed how the
+# small model interpreted light requests in testing.
+SENSOR_LIST = "; ".join(
+    f"{name}={entity_id}" for name, entity_id in KNOWN_SENSORS.items()
+)
 
 # Static instruction; it sits in the cached prefix so it costs nothing per
 # request after the first.
@@ -599,7 +644,8 @@ TOOLS = [
             "name": "get_home_assistant_state",
             "description": (
                 "Fetch a Home Assistant entity's current state. "
-                "Use only for values not already provided in home_state."
+                "Use only for values not already provided in home_state. "
+                f"Known sensors: {SENSOR_LIST}"
             ),
             "parameters": {
                 "type": "object",
