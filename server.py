@@ -53,11 +53,19 @@ HA_TRACKED_ENTITIES = {
     "sensor.power_production_now": "current solar power coming in",
     "sensor.saj_total_load_power": "current power used",
     "sensor.home_energy_manager_state": "state of the heatpump",
+    "sensor.energy_production_today": "total solar generated today",
+    "sensor.energy_production_tomorrow": "solar forecast for tomorrow",
+    "sensor.saj_sum_all_phases_feed_in_today": "total solar exported today",
+    "sensor.saj_total_today_load": "total power used today",
 }
 HA_UNITS = {
     "battery SoC": "percent",
     "current solar power coming in": "Watt",
     "current power used": "Watt",
+    "total solar generated today": "kWh",
+    "solar forecast for tomorrow": "kWh",
+    "total solar exported today": "kWh",
+    "total power used today": "kWh",
 }
 HA_TRACKED_LIGHTS = {
     "light.all_lights": "All lights",
@@ -78,6 +86,14 @@ KNOWN_SENSORS = {
     "battery temperature": "sensor.saj_battery_temperature",
     "inverter temperature": "sensor.saj_inverter_temperature",
     "system flow temperature": "sensor.home_system_flow_temperature",
+    "weather": "weather.forecast_home",
+    "sun status": "sun.sun",
+    "sunrise": "sensor.sun_next_rising",
+    "sunset": "sensor.sun_next_setting",
+    "water pressure": "sensor.home_system_water_pressure",
+    "heating efficiency": "sensor.home_heating_energy_efficiency",
+    "hot water setpoint": "sensor.home_domestic_hot_water_0_setpoint",
+    "hot water mode": "sensor.home_domestic_hot_water_0_operation_mode",
 }
 # HA_TRACKED_ENTITIES are deliberately omitted: their values are already in
 # home_state, so listing them here tempts the model into a redundant tool round.
@@ -190,7 +206,7 @@ def fetch_relevant_ha_states():
     return [entity for entity in states if entity_matches(entity, HA_TRACKED_ENTITIES)]
 
 
-_ha_state_cache = {"fetched_at": 0.0, "states": []}
+_ha_state_cache = {"fetched_at": 0.0, "states": [], "time": ""}
 
 
 def cached_ha_states():
@@ -199,6 +215,9 @@ def cached_ha_states():
         if states is not None:
             _ha_state_cache["states"] = states
         _ha_state_cache["fetched_at"] = time.time()
+        # Refreshed with the state, not every minute: changing the prompt every
+        # minute would invalidate llama.cpp's cached prefix needlessly.
+        _ha_state_cache["time"] = time.strftime("%H:%M")
     return _ha_state_cache["states"]
 
 
@@ -220,6 +239,9 @@ def ha_context():
             # resolve to the HA entity (e.g. "state of the heatpump" lives at
             # sensor.home_energy_manager_state).
             lines.append(f"{entity_id} ({name}): {value}")
+    # Updated with the 10-minute state refresh, so the prompt stays byte-for-byte
+    # stable between refreshes and llama.cpp can reuse the cached prefix.
+    lines.append(f"Current time: {_ha_state_cache['time'] or time.strftime('%H:%M')}")
     lines.append("</home_state>")
     return "\n".join(lines)
 
@@ -668,7 +690,10 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "entity_id": {"type": "string", "description": "Name from the list or an entity id."},
-                    "state": {"type": "string", "description": "'on' or 'off'."},
+                    "state": {
+                        "type": "string",
+                        "description": "'on' supplies more light; 'off' removes light.",
+                    },
                     "brightness": {"type": "number", "description": "0-100."},
                     "color": {"type": "string", "description": "Color name or hex."},
                 },
