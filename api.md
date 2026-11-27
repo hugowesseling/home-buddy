@@ -40,7 +40,7 @@ A suitable llama.cpp backend can be started with:
 
 `--load-mode mmap+mlock` keeps the model locked in RAM so it is never swapped out; the included `llama-server.service` runs this command under systemd with automatic restart. A cold uncached prompt costs several seconds, so the server should be left running.
 
-Repeated identical tool calls are detected and stopped to prevent loops; if no answer is produced, a short fallback reply is returned. Tool results are handled directly for the action tools `set_light` and `set_disco`: the server turns the Home Assistant result into a short confirmation without asking the model for a second reply. Informational tool results (`get_home_assistant_state`) are fed back to the model for a final answer. Each model call's backend, model, finish reason and timings are appended to `llm.log` as `STATS` records. Llama.cpp also logs its build fingerprint, cached-token count and throughput.
+`set_light` replies report the requested brightness percentage, since Home Assistant's state can briefly lag behind the service call. Repeated identical tool calls are detected and stopped to prevent loops; if no answer is produced, a short fallback reply is returned. Tool results are handled directly for the action tools `set_light` and `set_disco`: the server turns the Home Assistant result into a short confirmation without asking the model for a second reply. Informational tool results (`get_home_assistant_state`) are fed back to the model for a final answer. Each model call's backend, model, finish reason and timings are appended to `llm.log` as `STATS` records. Llama.cpp also logs its build fingerprint, cached-token count and throughput.
 
 ## Streaming response (`stream: true`)
 

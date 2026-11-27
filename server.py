@@ -501,6 +501,10 @@ def set_light(entity_id=None, state=None, brightness=None, color=None):
     # HA state fetches take only a few milliseconds, so a short interval keeps
     # the added latency low without hammering the API.
     expected = "off" if service == "light/turn_off" else "on"
+    # HA updates a light's brightness a moment after the service call. Waiting
+    # only for "on" returns a stale brightness (often the previous level) when
+    # the light was already on, so wait for the requested level too.
+    target_brightness = data.get("brightness") if brightness is not None else None
     for _ in range(40):
         time.sleep(0.05)
         try:
@@ -511,7 +515,15 @@ def set_light(entity_id=None, state=None, brightness=None, color=None):
             if entity.get("entity_id") != resolved:
                 continue
             state = entity.get("state")
-            if state == expected or state != previous:
+            if target_brightness is not None:
+                reported = (entity.get("attributes") or {}).get("brightness")
+                if (
+                    state == expected
+                    and reported is not None
+                    and abs(float(reported) - float(target_brightness)) <= 2
+                ):
+                    return _light_result(entity)
+            elif state == expected or state != previous:
                 return _light_result(entity)
             break
     # Fall back to the current state.
@@ -743,14 +755,6 @@ def execute_tool(tool_call):
     return f"Error: unknown tool {name!r}."
 
 
-def _brightness_percent(value):
-    """Home Assistant reports brightness on 0-255; users think in 0-100."""
-    try:
-        return int(round(float(value) / 2.55))
-    except (TypeError, ValueError):
-        return None
-
-
 def tool_result_reply(results):
     """Build a reply from action-tool results, or None if the model must run again.
 
@@ -782,9 +786,20 @@ def tool_result_reply(results):
         if data.get("state") == "off":
             parts.append(f"Turned {light} off.")
             continue
-        brightness = _brightness_percent(data.get("brightness"))
-        if brightness is not None:
-            parts.append(f"Set {light} to {brightness}%.")
+        # Report the requested level, not HA's polled brightness: the entity
+        # state can briefly lag behind the service call and show the old value.
+        requested = None
+        try:
+            arguments = json.loads(
+                (tool_call.get("function") or {}).get("arguments") or "{}"
+            )
+            if isinstance(arguments, dict) and arguments.get("brightness") is not None:
+                requested = float(arguments["brightness"])
+        except (TypeError, ValueError):
+            pass
+        if requested is not None:
+            percent = int(round(max(0.0, min(100.0, requested))))
+            parts.append(f"Set {light} to {percent}%.")
         elif data.get("state") == "on":
             parts.append(f"Turned {light} on.")
         else:
