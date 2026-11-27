@@ -1,12 +1,12 @@
 # home-buddy
 
-A small OpenAI-compatible chat API that answers questions about your home and controls Home Assistant through a local `qwen3.5:2b` model. It talks to llama.cpp directly, streams replies token-by-token, and exposes HA state plus light/disco controls as model tools.
+A small OpenAI-compatible chat API that answers questions about your home and controls Home Assistant through a local `ling-3.0-tiny` model. It talks to llama.cpp directly, streams replies token-by-token, and exposes HA state plus light/disco controls as model tools.
 
 ## Requirements
 
 - Python 3 (standard library only)
 - Home Assistant at `http://127.0.0.1:8123` with a long-lived access token
-- A llama.cpp `llama-server` serving `qwen3.5:2b`
+- A llama.cpp `llama-server` serving `ling-3.0-tiny`
 
 ## Setup
 
@@ -33,7 +33,7 @@ A small OpenAI-compatible chat API that answers questions about your home and co
 ```bash
 curl -X POST http://127.0.0.1:8971/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen3.5:2b","messages":[{"role":"user","content":"It is a bit dark here"}],"stream":true}'
+  -d '{"model":"ling-3.0-tiny","messages":[{"role":"user","content":"It is a bit dark here"}],"stream":true}'
 ```
 
 Returns a standard OpenAI completion, or SSE chunks ending in `data: [DONE]` when `stream: true`.
@@ -43,7 +43,7 @@ Returns a standard OpenAI completion, or SSE chunks ending in `data: [DONE]` whe
 | Variable | Default | Description |
 | --- | --- | --- |
 | `LLAMA_HOST` | `http://127.0.0.1:18080` | llama.cpp server URL |
-| `LLAMA_MODEL` | `qwen3.5:2b` | model alias used with llama.cpp |
+| `LLAMA_MODEL` | `ling-3.0-tiny` | model alias used with llama.cpp |
 | `LLAMA_TEMPERATURE` | `0` | sampling temperature for llama.cpp |
 | `HA_TOKEN` | `ha_token` file | Home Assistant long-lived access token |
 

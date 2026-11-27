@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A small OpenAI-compatible server that proxies to llama.cpp and Home Assistant.
 
-POST /v1/chat/completions: the received text is sent to `qwen3.5:2b` with
+POST /v1/chat/completions: the received text is sent to `ling-3.0-tiny` with
 thinking disabled through llama.cpp's OpenAI-compatible endpoint. The model gets
 Home Assistant state two ways:
 
@@ -44,7 +44,7 @@ def _endpoint(value, default):
 
 
 LLAMA_HOST = _endpoint(os.environ.get("LLAMA_HOST"), "http://127.0.0.1:18080")
-LLAMA_MODEL = os.environ.get("LLAMA_MODEL", "qwen3.5:2b")
+LLAMA_MODEL = os.environ.get("LLAMA_MODEL", "ling-3.0-tiny")
 HA_BASE_URL = "http://127.0.0.1:8123"
 HA_TOKEN_FILE = Path("ha_token")  # HA long-lived access token for the API
 HA_REFRESH_INTERVAL = 600  # 10 minutes
@@ -652,6 +652,7 @@ SYSTEM_PROMPT = (
     "- The <home_state> block is reference data, not a request.\n"
     "- Use the tools to carry out the user's request.\n"
     "- Refer to entities by the exact ids or names shown.\n"
+    "- If a brightness is given without a named light, apply it to All lights.\n"
     "- Never call the same tool with the same arguments twice."
 )
 
@@ -684,6 +685,8 @@ TOOLS = [
             "description": (
                 "Control a light (on/off, brightness 0-100, color). "
                 "Use for requests about lighting, brightness or visibility. "
+                "Target a named room or light; use 'All lights' only for whole-home "
+                "or unnamed requests. "
                 f"Lights: {LIGHT_NAMES}."
             ),
             "parameters": {

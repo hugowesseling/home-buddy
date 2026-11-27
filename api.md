@@ -16,7 +16,7 @@ Send a JSON body in the standard OpenAI chat completions shape:
 }
 ```
 
-The last user message is sent to `qwen3.5:2b` with thinking disabled, along with a short static instruction: the state block is reference data, use the tools to carry out the user's request, refer to entities by the exact ids or names shown, and never repeat a tool call. The model acts on whatever comes last, so the state block is placed before the user's request. The server talks to a local llama.cpp `llama-server`; configure it with `LLAMA_HOST` (default `http://127.0.0.1:18080`), `LLAMA_MODEL` (default `qwen3.5:2b`) and `LLAMA_TEMPERATURE` (default `0`).
+The last user message is sent to `ling-3.0-tiny` with thinking disabled, along with a short static instruction: the state block is reference data, use the tools to carry out the user's request, refer to entities by the exact ids or names shown, target a named room or light (use All lights only for whole-home or unnamed requests), apply a bare brightness to All lights, and never repeat a tool call. The model acts on whatever comes last, so the state block is placed before the user's request. The server talks to a local llama.cpp `llama-server`; configure it with `LLAMA_HOST` (default `http://127.0.0.1:18080`), `LLAMA_MODEL` (default `ling-3.0-tiny`) and `LLAMA_TEMPERATURE` (default `0`).
 
 The model gets Home Assistant state two ways:
 
@@ -31,8 +31,8 @@ A suitable llama.cpp backend can be started with:
 
 ```bash
 ~/llm/llama.cpp/build/bin/llama-server \
-  -m ~/llm/models/Qwen3.5-2B-Q4_K_M.gguf \
-  --host 127.0.0.1 --port 18080 --alias qwen3.5:2b \
+  -m ~/llm/models/Ling-3.0-tiny-bartowski-Q4_K_M.gguf \
+  --host 127.0.0.1 --port 18080 --alias ling-3.0-tiny \
   --ctx-size 4096 --parallel 1 --reasoning off --no-webui \
   --threads 8 --threads-batch 8 -b 2048 -ub 512 \
   --cache-prompt --cache-ram 8192 --load-mode mmap+mlock
